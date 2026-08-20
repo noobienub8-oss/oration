@@ -281,10 +281,10 @@
         <p class="eyebrow">Working on it</p>
         <h1 class="prompt" style="font-size:22px;">Sending this to your teacher</h1>
         <div class="steps">
-          <div class="step" id="stepTranscribe"><span class="dot">&#10003;</span> Transcribing your speech (Sarvam)</div>
+          <div class="step" id="stepTranscribe"><span class="dot">&#10003;</span> Transcribing your speech (Gemini)</div>
           <div class="step-note hidden" id="stepTranscribeNote"></div>
-          <div class="step" id="stepSummary"><span class="dot">&#10003;</span> Writing your teacher's note (Groq)</div>
-          <div class="step" id="stepRecommend"><span class="dot">&#10003;</span> Finding your next exercise (OpenRouter)</div>
+          <div class="step" id="stepSummary"><span class="dot">&#10003;</span> Writing your teacher's note (Gemini)</div>
+          <div class="step" id="stepRecommend"><span class="dot">&#10003;</span> Finding your next exercise (Gemini)</div>
         </div>
         <div id="pipelineErrorBox"></div>
       </div>
@@ -364,18 +364,10 @@
 <!-- settings modal -->
 <div class="overlay" id="settingsOverlay">
   <div class="modal">
-    <h3>API keys</h3>
-    <p class="sub">Groq, OpenRouter, and Gemini keys are stored only in this browser's local storage and called directly from here. The Sarvam key lives server-side — see README.md.</p>
+    <h3>API key</h3>
+    <p class="sub">Your Gemini key is stored only in this browser's local storage and called directly from here. It powers all three steps: transcription, the teacher's note, and exercise recommendations.</p>
     <div class="field">
-      <label for="keyGroq">Groq API key</label>
-      <input id="keyGroq" type="password" placeholder="gsk_...">
-    </div>
-    <div class="field">
-      <label for="keyOpenRouter">OpenRouter API key</label>
-      <input id="keyOpenRouter" type="password" placeholder="sk-or-...">
-    </div>
-    <div class="field">
-      <label for="keyGemini">Gemini API key <span style="font-weight:400;color:var(--ink-faint);">(fallback if Sarvam fails)</span></label>
+      <label for="keyGemini">Gemini API key</label>
       <input id="keyGemini" type="password" placeholder="AIza...">
     </div>
     <div class="modal-actions">
@@ -446,7 +438,7 @@ const DEMO_LEADERBOARD_FILLER = [
   { name:"Kabir", xp:150 }
 ];
 
-let apiKeys = { groq:'', openrouter:'', gemini:'' };
+let apiKeys = { gemini:'' };
 let currentPrompt = '';
 let mediaRecorder, audioChunks = [], recordedBlob = null, recordedDuration = 0;
 let audioCtx, analyser, waveRAF, recTimerInterval, recSecondsLeft = 25;
@@ -459,10 +451,20 @@ let authMode = 'login', signupRole = 'student';
    INIT
    ============================================================ */
 window.addEventListener('DOMContentLoaded', async () => {
-  const savedKeys = localStorage.getItem(LS_KEYS.apiKeys);
-  if (savedKeys) apiKeys = JSON.parse(savedKeys);
-  document.getElementById('keyGroq').value = apiKeys.groq || '';
-  document.getElementById('keyOpenRouter').value = apiKeys.openrouter || '';
+  // Merge rather than replace: browsers that used an earlier version of this
+  // app still have a stored object shaped like {groq, openrouter, gemini}.
+  // Assigning it wholesale would carry dead keys around, and a corrupt or
+  // pre-Gemini entry would leave apiKeys with no .gemini at all. Merging into
+  // the default keeps the current shape and silently drops the stale fields.
+  try{
+    const savedKeys = localStorage.getItem(LS_KEYS.apiKeys);
+    if (savedKeys){
+      const parsed = JSON.parse(savedKeys);
+      if (parsed && typeof parsed === 'object') apiKeys = { ...apiKeys, gemini: parsed.gemini || '' };
+    }
+  }catch(e){
+    console.warn('Ignoring unreadable saved keys:', e.message);
+  }
   document.getElementById('keyGemini').value = apiKeys.gemini || '';
 
   if (!initSupabase()) return;
@@ -583,8 +585,6 @@ function openSettings(){ document.getElementById('settingsOverlay').classList.ad
 function closeSettings(){ document.getElementById('settingsOverlay').classList.remove('open'); }
 function saveSettings(){
   apiKeys = {
-    groq: document.getElementById('keyGroq').value.trim(),
-    openrouter: document.getElementById('keyOpenRouter').value.trim(),
     gemini: document.getElementById('keyGemini').value.trim()
   };
   localStorage.setItem(LS_KEYS.apiKeys, JSON.stringify(apiKeys));
@@ -789,11 +789,11 @@ async function startPipeline(){
     setStep('stepTranscribe','done');
 
     setStep('stepSummary','active');
-    const summary = await summarizeWithGroq(transcript, metrics, currentPrompt);
+    const summary = await summarizeWithGemini(transcript, metrics, currentPrompt);
     setStep('stepSummary','done');
 
     setStep('stepRecommend','active');
-    const recommendations = await recommendWithOpenRouter(summary);
+    const recommendations = await recommendWithGemini(summary);
     setStep('stepRecommend','done');
 
     const { error: insertErr } = await sb.from('submissions').insert({
@@ -829,130 +829,28 @@ async function finishAndShowResult(metrics){
 }
 
 /* ============================================================
-   API CALL 1 — transcription, Sarvam first, Gemini as fallback
+   API CALL 1 — transcription (Gemini)
    ============================================================ */
 async function transcribeAudio(blob){
-  try{
-    const text = await transcribeWithSarvam(blob);
-    return { text, provider: 'Sarvam' };
-  }catch(sarvamErr){
-    // Log the real reason even when Gemini's fallback saves the request —
-    // otherwise "Sarvam unavailable" gives no way to tell a bad key, a
-    // quota limit, and a format error apart. Check the browser console.
-    console.error('Sarvam failed, falling back to Gemini. Sarvam error:', sarvamErr.message);
-    const note = document.getElementById('stepTranscribeNote');
-    note.textContent = 'Sarvam unavailable — trying Gemini instead\u2026';
-    note.classList.remove('hidden');
-    try{
-      const text = await transcribeWithGemini(blob);
-      note.textContent = 'Transcribed via Gemini (Sarvam error: ' + sarvamErr.message.slice(0,120) + ')';
-      return { text, provider: 'Gemini (fallback)' };
-    }catch(geminiErr){
-      throw new Error('Both transcription providers failed.\nSarvam: ' + sarvamErr.message + '\nGemini: ' + geminiErr.message);
-    }
-  }
+  const text = await transcribeWithGemini(blob);
+  return { text, provider: 'Gemini' };
 }
 
-/* Sarvam only accepts a specific list of audio containers (mp3/wav/aac/aiff/
-   raw PCM — see functions/sarvam-transcribe.js error message). Browsers'
-   MediaRecorder defaults to audio/webm;codecs=opus, which is NOT in that
-   list and Sarvam 400s on it every time, regardless of API key. Gemini
-   accepts webm directly so it doesn't need this — only the Sarvam path does.
-   This decodes the recording with the browser's own audio decoder (handles
-   opus natively) and re-encodes it as 16-bit PCM WAV before sending. */
-async function blobToWav(blob){
-  const arrayBuffer = await blob.arrayBuffer();
-  const AudioCtx = window.AudioContext || window.webkitAudioContext;
-  const audioCtx = new AudioCtx();
-  let audioBuffer;
-  try{
-    audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-  }catch(e){
-    audioCtx.close();
-    throw new Error('Could not decode recording for WAV conversion: ' + e.message);
-  }
-  const wavBlob = encodeWavFromAudioBuffer(audioBuffer);
-  audioCtx.close();
-  return wavBlob;
-}
+/* Called directly from the browser (Google's API documents CORS support).
 
-function encodeWavFromAudioBuffer(buffer){
-  const numChannels = buffer.numberOfChannels;
-  const sampleRate = buffer.sampleRate;
-  const bitDepth = 16;
-  const bytesPerSample = bitDepth / 8;
-  const blockAlign = numChannels * bytesPerSample;
+   Models are tried in order and a 404 or 503 falls through to the next one.
+   Google retires Flash models fairly aggressively (2.5-flash stopped accepting
+   new keys in 2026), and a 404 on a dead model is indistinguishable from a
+   real outage mid-demo. Listing two current models means one retirement — or
+   one model being temporarily overloaded — isn't a live failure.
 
-  let samples;
-  if (numChannels === 2){
-    const left = buffer.getChannelData(0), right = buffer.getChannelData(1);
-    samples = new Float32Array(left.length + right.length);
-    for (let i = 0, j = 0; i < left.length; i++){ samples[j++] = left[i]; samples[j++] = right[i]; }
-  } else {
-    samples = buffer.getChannelData(0);
-  }
-
-  const dataSize = samples.length * bytesPerSample;
-  const out = new ArrayBuffer(44 + dataSize);
-  const view = new DataView(out);
-  const writeStr = (offset, str) => { for (let i=0;i<str.length;i++) view.setUint8(offset+i, str.charCodeAt(i)); };
-
-  writeStr(0, 'RIFF');
-  view.setUint32(4, 36 + dataSize, true);
-  writeStr(8, 'WAVE');
-  writeStr(12, 'fmt ');
-  view.setUint32(16, 16, true);       // PCM fmt chunk size
-  view.setUint16(20, 1, true);        // PCM format
-  view.setUint16(22, numChannels, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * blockAlign, true);
-  view.setUint16(32, blockAlign, true);
-  view.setUint16(34, bitDepth, true);
-  writeStr(36, 'data');
-  view.setUint32(40, dataSize, true);
-
-  let offset = 44;
-  for (let i = 0; i < samples.length; i++, offset += 2){
-    const s = Math.max(-1, Math.min(1, samples[i]));
-    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
-  }
-
-  return new Blob([view], { type: 'audio/wav' });
-}
-
-/* Sarvam — routed through functions/sarvam-transcribe.js, a Cloudflare Pages
-   Function (server-to-server, see README) */
-async function transcribeWithSarvam(blob){
-  const wavBlob = await blobToWav(blob);
-  const arrayBuffer = await wavBlob.arrayBuffer();
-  const audio_base64 = arrayBufferToBase64(arrayBuffer);
-  const res = await fetch('/sarvam-transcribe', {
-    method:'POST',
-    headers: { 'Content-Type':'application/json' },
-    body: JSON.stringify({ audio_base64, mime_type: 'audio/wav', language_code: 'en-IN' })
-  });
-  const raw = await res.text();
-  if (!res.ok) throw new Error('Sarvam STT error (' + res.status + '): ' + raw.slice(0,300));
-  let data;
-  try{ data = JSON.parse(raw); }catch(e){ throw new Error('Sarvam STT returned non-JSON: ' + raw.slice(0,300)); }
-  const transcript = data.transcript || data.text || '';
-  if (!transcript) throw new Error('Sarvam STT returned no transcript field. Raw: ' + raw.slice(0,300));
-  return transcript;
-}
-
-/* Gemini fallback — called directly from the browser (Google's API documents CORS support).
-
-   Models are tried in order and a 404 falls through to the next one. Google retires
-   Flash models fairly aggressively (2.5-flash stopped accepting new keys in 2026), and
-   a 404 on a dead model is indistinguishable from a real outage mid-demo. Listing two
-   current models means one retirement isn't a live failure.
-
-   Both entries below accept audio input. Verify against ai.google.dev/gemini-api/docs/models
+   Both entries below accept audio input, and both are used for all three
+   steps in this app. Verify against ai.google.dev/gemini-api/docs/models
    before a demo if this code has been sitting for a while. */
 const GEMINI_MODELS = ['gemini-3.7-flash', 'gemini-3.6-flash'];
 
 async function transcribeWithGemini(blob){
-  if (!apiKeys.gemini) throw new Error('Missing Gemini API key — add it in Settings for the fallback to work.');
+  if (!apiKeys.gemini) throw new Error('Missing Gemini API key — add it in Settings.');
   const arrayBuffer = await blob.arrayBuffer();
   const base64 = arrayBufferToBase64(arrayBuffer);
 
@@ -991,6 +889,36 @@ async function transcribeWithGemini(blob){
   throw new Error('No available Gemini model. Tried ' + GEMINI_MODELS.join(', ') + '. Last: ' + lastErr);
 }
 
+/* Reusable Gemini text call — same model list and 404/503 fallthrough as the
+   transcription path, but for plain text in / text out. Both the teacher-note
+   and exercise-recommendation steps run through here, so the model list only
+   needs updating in one place (GEMINI_MODELS) if Google retires a model. */
+async function geminiText(sys, user){
+  if (!apiKeys.gemini) throw new Error('Missing Gemini API key — add it in Settings.');
+  const body = JSON.stringify({
+    contents:[{ parts:[{ text: sys + '\n\n' + user }] }]
+  });
+  let lastErr = '';
+  for (const model of GEMINI_MODELS){
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+      method:'POST',
+      headers: { 'x-goog-api-key': apiKeys.gemini, 'Content-Type':'application/json' },
+      body
+    });
+    const raw = await res.text();
+    if (res.status === 404 || res.status === 503){
+      lastErr = model + ' -> ' + res.status + ': ' + raw.slice(0,200);
+      continue;
+    }
+    if (!res.ok) throw new Error('Gemini error (' + res.status + ') on ' + model + ': ' + raw.slice(0,300));
+    const data = JSON.parse(raw);
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    if (!text) throw new Error('Gemini returned no text from ' + model + '.');
+    return text.trim();
+  }
+  throw new Error('No available Gemini model. Tried ' + GEMINI_MODELS.join(', ') + '. Last: ' + lastErr);
+}
+
 function arrayBufferToBase64(buffer){
   let binary = '';
   const bytes = new Uint8Array(buffer);
@@ -1002,80 +930,48 @@ function arrayBufferToBase64(buffer){
 }
 
 /* ============================================================
-   API CALL 2 — Groq (teacher summary)
+   API CALL 2 — teacher summary (Gemini)
    ============================================================ */
-// llama-3.3-70b-versatile was retired by Groq on 08/16/26. Their own
-// deprecation page (console.groq.com/docs/deprecations) names
-// openai/gpt-oss-120b as the direct replacement, so that's primary here,
-// with qwen/qwen3.6-27b (their other named replacement) as a fallback in
-// case gpt-oss-120b is ever pulled too.
-const GROQ_MODELS = ['openai/gpt-oss-120b', 'qwen/qwen3.6-27b'];
-
-async function summarizeWithGroq(transcript, metrics, prompt){
-  if (!apiKeys.groq) throw new Error('Missing Groq API key — add it in Settings.');
+async function summarizeWithGemini(transcript, metrics, prompt){
   const sys = "You are writing a first-impression note for a teacher who has never seen this student speak before. Be factual and kind — this is a first read, not a verdict. Describe behavior, don't diagnose anxiety or any internal state. Return ONLY valid JSON, no markdown fences, matching this shape: {\"headline\": string, \"observations\": [string, string, string]}. Exactly one observation on fluency, one on composure, one on structure.";
   const user = "Prompt given to student: " + prompt + "\nTranscript: " + transcript + "\nMetrics: " + JSON.stringify(metrics);
-  let lastErr = '';
-  for (const model of GROQ_MODELS){
-    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method:'POST',
-      headers: { 'Authorization':'Bearer ' + apiKeys.groq, 'Content-Type':'application/json' },
-      body: JSON.stringify({ model, messages:[{role:'system',content:sys},{role:'user',content:user}], temperature:0.4 })
-    });
-    const raw = await res.text();
-    if (res.status === 404 || res.status === 503){
-      lastErr = model + ' -> ' + res.status + ': ' + raw.slice(0,200);
-      continue;
-    }
-    if (!res.ok) throw new Error('Groq error (' + res.status + ') on ' + model + ': ' + raw.slice(0,300));
-    const data = JSON.parse(raw);
-    const content = data.choices?.[0]?.message?.content || '{}';
-    return parseJsonLoose(content);
-  }
-  throw new Error('No available Groq model. Tried ' + GROQ_MODELS.join(', ') + '. Last: ' + lastErr);
+  return parseJsonLoose(await geminiText(sys, user));
 }
 
 /* ============================================================
-   API CALL 3 — OpenRouter (exercise recommendations)
+   API CALL 3 — exercise recommendations (Gemini)
    ============================================================ */
-// meta-llama/llama-3.3-70b-instruct:free was pulled from OpenRouter's free
-// tier entirely (not renamed — the whole free Meta Llama lineup was
-// delisted). openrouter/free is OpenRouter's own auto-router: it always
-// resolves to *some* currently-free model, so it self-adapts as the free
-// roster keeps rotating instead of hardcoding a specific ID that can die
-// again. The two named fallbacks are current, widely-mirrored free models
-// as of Aug 2026, in case the router itself ever has an issue.
-const OPENROUTER_MODELS = ['openrouter/free', 'openai/gpt-oss-20b:free', 'google/gemma-4-31b-it:free'];
-
-async function recommendWithOpenRouter(summary){
-  if (!apiKeys.openrouter) throw new Error('Missing OpenRouter API key — add it in Settings.');
+async function recommendWithGemini(summary){
   const libraryText = EXERCISE_LIBRARY.map(e => `- ${e.name} (addresses: ${e.tag}): ${e.desc}`).join('\n');
   const sys = "Select the 2 most relevant exercises from the library below for this student, based on their summary. Do not invent exercises outside the list. Return ONLY valid JSON, no markdown fences, as: [{\"exercise\": string, \"reason\": string}]. Keep each reason to one short sentence.\n\nEXERCISE LIBRARY:\n" + libraryText;
   const user = "Student summary: " + JSON.stringify(summary);
-
-  let lastErr = '';
-  for (const model of OPENROUTER_MODELS){
-    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method:'POST',
-      headers: { 'Authorization':'Bearer ' + apiKeys.openrouter, 'Content-Type':'application/json', 'HTTP-Referer': window.location.href, 'X-Title': 'Oration demo' },
-      body: JSON.stringify({ model, messages:[{role:'system',content:sys},{role:'user',content:user}], temperature:0.4 })
-    });
-    const raw = await res.text();
-    if (res.status === 404 || res.status === 503){
-      lastErr = model + ' -> ' + res.status + ': ' + raw.slice(0,200);
-      continue;
-    }
-    if (!res.ok) throw new Error('OpenRouter error (' + res.status + ') on ' + model + ': ' + raw.slice(0,300));
-    const data = JSON.parse(raw);
-    const content = data.choices?.[0]?.message?.content || '[]';
-    return parseJsonLoose(content);
-  }
-  throw new Error('No available OpenRouter model. Tried ' + OPENROUTER_MODELS.join(', ') + '. Last: ' + lastErr);
+  return parseJsonLoose(await geminiText(sys, user));
 }
 
+/* Both remaining AI calls ask Gemini for raw JSON, but models sometimes wrap
+   it in markdown fences or add a sentence before/after it despite the
+   instruction. Strip fences first, then — if that still won't parse — slice
+   out the outermost {...} or [...] and parse that. Cheap insurance against a
+   whole demo step failing over a stray "Here's the JSON:" preamble. */
 function parseJsonLoose(text){
   const cleaned = text.replace(/```json|```/g,'').trim();
-  return JSON.parse(cleaned);
+  try{
+    return JSON.parse(cleaned);
+  }catch(e){
+    // Find whichever of { or [ appears first, and match it to its closing partner.
+    const objStart = cleaned.indexOf('{');
+    const arrStart = cleaned.indexOf('[');
+    let start, end;
+    if (arrStart !== -1 && (objStart === -1 || arrStart < objStart)){
+      start = arrStart; end = cleaned.lastIndexOf(']');
+    } else {
+      start = objStart; end = cleaned.lastIndexOf('}');
+    }
+    if (start !== -1 && end > start){
+      return JSON.parse(cleaned.slice(start, end + 1));
+    }
+    throw new Error('Could not parse JSON from model response: ' + cleaned.slice(0,200));
+  }
 }
 
 /* ============================================================
@@ -1170,7 +1066,7 @@ function loadSampleData(){
     student_name: 'Demo student',
     prompt: "Describe your ideal weekend, start to finish.",
     transcript: "So, um, my ideal weekend would probably start with, like, sleeping in a bit and then maybe going for a walk. I think, uh, spending time outside really helps me relax, and then in the evening I'd probably just watch a movie with friends.",
-    metrics: { duration_seconds: 22, word_count: 46, words_per_minute: 125, filler_word_count: 4, filler_words_per_minute: 10.9, transcription_provider: 'Sarvam' },
+    metrics: { duration_seconds: 22, word_count: 46, words_per_minute: 125, filler_word_count: 4, filler_words_per_minute: 10.9, transcription_provider: 'Gemini' },
     summary: {
       headline: "Comfortable talker, but leans on filler words when starting new ideas",
       observations: [
